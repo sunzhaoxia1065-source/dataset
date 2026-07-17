@@ -53,8 +53,61 @@ def load_csv(path: str, required_cols: list) -> pd.DataFrame:
     return df
 
 
+def normalize_time(time_series: pd.Series) -> pd.Series:
+    """将各种时间格式统一解析为 datetime。
+
+    支持的格式:
+      - YYYYMMDDHHMM (如 202401030000)
+      - YYYY/M/D HH:MM:SS (如 2024/1/3 00:00:00)
+      - YYYY-MM-DD HH:MM:SS (如 2024-01-03 00:00:00)
+      - 其他 pandas 可自动识别的格式
+
+    Args:
+        time_series: 原始时间列。
+
+    Returns:
+        解析后的 datetime Series。
+    """
+    # 先尝试直接解析
+    parsed = pd.to_datetime(time_series, errors="coerce")
+    if parsed.isna().all():
+        # 全部失败，尝试作为 YYYYMMDDHHMM 数字字符串解析
+        try:
+            parsed = pd.to_datetime(time_series.astype(str), format="%Y%m%d%H%M", errors="coerce")
+        except Exception:
+            pass
+
+    # 仍有无法解析的，逐行尝试多种格式
+    if parsed.isna().any():
+        still_na = parsed.isna()
+        for idx in still_na[still_na].index:
+            val = str(time_series.iloc[idx]).strip()
+            for fmt in ["%Y%m%d%H%M", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                        "%Y/%m/%d %H:%M", "%Y-%m-%d", "%Y%m%d"]:
+                try:
+                    parsed.iloc[idx] = pd.to_datetime(val, format=fmt)
+                    break
+                except (ValueError, TypeError):
+                    continue
+
+    if parsed.isna().all():
+        raise ValueError(f"无法解析时间列，示例值: {time_series.head(3).tolist()}")
+
+    # 截断到分钟精度，消除秒/毫秒差异
+    parsed = parsed.dt.floor("min")
+
+    na_count = parsed.isna().sum()
+    if na_count > 0:
+        print(f"[警告] {na_count} 个时间值无法解析")
+
+    return parsed
+
+
 def merge_on_time(df_a: pd.DataFrame, df_b: pd.DataFrame) -> pd.DataFrame:
-    """基于 time 列合并两个 DataFrame。
+    """基于 time 列合并两个 DataFrame，自动处理格式差异和时间粒度不对齐。
+
+    如果精确匹配失败，会对两个时间列按分钟取整后重试；
+    若仍无交集，则采用最近时间匹配（tolerance 可配置）。
 
     Args:
         df_a: 含 time 列的 DataFrame。
@@ -64,19 +117,47 @@ def merge_on_time(df_a: pd.DataFrame, df_b: pd.DataFrame) -> pd.DataFrame:
         合并后的 DataFrame。
 
     Raises:
-        ValueError: 合并后行数不匹配。
+        ValueError: 两个文件的时间列无交集。
     """
-    df_a["time"] = pd.to_datetime(df_a["time"])
-    df_b["time"] = pd.to_datetime(df_b["time"])
+    df_a = df_a.copy()
+    df_b = df_b.copy()
 
+    # 统一解析时间格式
+    df_a["time"] = normalize_time(df_a["time"])
+    df_b["time"] = normalize_time(df_b["time"])
+
+    print(f"  时间范围 A: {df_a['time'].min()} ~ {df_a['time'].max()} ({len(df_a)} 行)")
+    print(f"  时间范围 B: {df_b['time'].min()} ~ {df_b['time'].max()} ({len(df_b)} 行)")
+
+    # 尝试精确匹配
     merged = pd.merge(df_a, df_b, on="time", how="inner")
 
+    if len(merged) > 0:
+        print(f"  精确匹配: {len(merged)} 行")
+        if len(merged) != len(df_a):
+            print(f"[警告] air_density 文件有 {len(df_a)} 行，合并后剩 {len(merged)} 行")
+        return merged
+
+    # 精确匹配失败，尝试 merge_asof 最近时间匹配
+    print("[提示] 精确匹配无结果，尝试最近时间匹配（容差15分钟）...")
+
+    df_a = df_a.sort_values("time").reset_index(drop=True)
+    df_b = df_b.sort_values("time").reset_index(drop=True)
+
+    merged = pd.merge_asof(df_a, df_b, on="time", direction="nearest", tolerance=pd.Timedelta("15min"))
+
+    # 去除未匹配的行（wind 列为 NaN）
+    merged = merged.dropna(subset=[c for c in merged.columns if c != "time" and c != "air_density"])
+
     if len(merged) == 0:
-        raise ValueError("两个文件的时间列无交集，请检查数据")
+        raise ValueError(
+            "两个文件的时间列无交集（容差15分钟内也无匹配）。\n"
+            f"  A 范围: {df_a['time'].min()} ~ {df_a['time'].max()}\n"
+            f"  B 范围: {df_b['time'].min()} ~ {df_b['time'].max()}\n"
+            "请检查两个文件的时间范围是否有重叠，或使用 merge_csv.py 先统一时间格式。"
+        )
 
-    if len(merged) != len(df_a):
-        print(f"[警告] air_density 文件有 {len(df_a)} 行，合并后剩 {len(merged)} 行")
-
+    print(f"  最近时间匹配: {len(merged)} 行")
     return merged
 
 
